@@ -1,19 +1,21 @@
-import { lerEstado, gravarEstado, aplicarAcao } from '../../../lib/game';
+import { lerEstado, registrarAcao } from '../../../lib/game';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+const semCache = { headers: { 'Cache-Control': 'no-store' } };
+
+// o histórico interno de ids não precisa ir para as telas
+function publico(estado) {
+  const { ids, ...resto } = estado;
+  return resto;
+}
+
 export async function GET() {
-  const estado = await lerEstado();
-  return Response.json(estado, {
-    headers: { 'Cache-Control': 'no-store' },
-  });
+  return Response.json(publico(await lerEstado()), semCache);
 }
 
 export async function POST(req) {
   const acao = await req.json();
-  const estado = await lerEstado();
-  const novo = aplicarAcao(estado, acao);
-  await gravarEstado(novo);
-  return Response.json(novo, { headers: { 'Cache-Control': 'no-store' } });
+  return Response.json(publico(await registrarAcao(acao)), semCache);
 }

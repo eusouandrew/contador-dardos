@@ -12,10 +12,40 @@ const RAIO_MIN_PX = 70;          // abaixo disso o dardo fica pequeno demais na 
 const LARG_CALIB = 480;          // resolução usada para achar o alvo pela cor
 const RAZAO_FRONTAL = 0.94;      // elipse mais redonda que isso = celular de frente
 const AVISO_SEM_DARDO_MS = 3500; // alvo balançou e nenhum dardo apareceu
+const VERSAO = '2026-10-12';      // vai junto nos registros da caixa-preta
+
+const novoId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+// imagens da caixa-preta (JPEG pequeno do recorte do alvo)
+function jpegDeImageData(img) {
+  const c = document.createElement('canvas');
+  c.width = img.width;
+  c.height = img.height;
+  c.getContext('2d').putImageData(img, 0, 0);
+  return c.toDataURL('image/jpeg', 0.82);
+}
+function jpegDeRGB(rgb, N) {
+  const img = new ImageData(N, N);
+  for (let i = 0, p = 0; i < N * N; i++, p += 3) {
+    img.data[i * 4] = rgb[p];
+    img.data[i * 4 + 1] = rgb[p + 1];
+    img.data[i * 4 + 2] = rgb[p + 2];
+    img.data[i * 4 + 3] = 255;
+  }
+  return jpegDeImageData(img);
+}
+function enviarRegistro(reg) {
+  fetch('/api/registros', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(reg),
+  }).catch(() => { /* caixa-preta é melhor-esforço */ });
+}
 
 const MOTIVOS = {
   aquecendo: 'Ajustando câmera…',
   movendo: 'Alvo se mexendo — esperando parar',
+  retirado: 'Dardo retirado',
   mao: 'Mão na frente — pausado',
   luz: 'Mudança de luz — conferindo',
   nada: 'Pronto — pode jogar',
@@ -79,7 +109,9 @@ export default function Camera() {
     ultimoMov: 0,
     atual: new Float32Array(TAM_PROC * TAM_PROC * 3),
     tmp: new Float32Array(TAM_PROC * TAM_PROC * 3),
-    dardosVideo: [],   // posições pontuadas, normalizadas no vídeo, para o overlay
+    recorte: null,     // { sx, sy, lado, vw, vh } do último quadro, para o overlay
+    ultimoImg: null,   // último recorte cru, para a caixa-preta
+    manuaisVistos: null, // ids de lances manuais já registrados
     ultimaMao: 0,
     gestoAtual: 0,
     gestoDesde: 0,
@@ -97,23 +129,53 @@ export default function Camera() {
   ref.current.estado = estado;
   ref.current.verDiag = verDiag;
 
-  const enviar = useCallback(async (acao) => {
+  // Fila de envio: cada lance tem id, então reenviar depois de uma falha de rede
+  // não conta o ponto duas vezes. A ordem é mantida.
+  const fila = useRef([]);
+  const despachando = useRef(false);
+  const [pendentes, setPendentes] = useState(0);
+
+  const despachar = useCallback(async () => {
+    if (despachando.current) return;
+    despachando.current = true;
     try {
-      const r = await fetch('/api/state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(acao),
-      });
-      setEstado(await r.json());
-    } catch {
-      setErro('Falha ao falar com o servidor');
+      while (fila.current.length) {
+        const acao = fila.current[0];
+        try {
+          const r = await fetch('/api/state', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(acao),
+          });
+          if (!r.ok) throw new Error(String(r.status));
+          setEstado(await r.json());
+          fila.current.shift();
+          setErro('');
+        } catch {
+          setErro('Sem conexão com o placar — tentando de novo…');
+          break;
+        }
+      }
+    } finally {
+      despachando.current = false;
+      setPendentes(fila.current.length);
     }
   }, []);
+
+  const enviar = useCallback((acao) => {
+    fila.current.push({ id: novoId(), ...acao });
+    setPendentes(fila.current.length);
+    despachar();
+  }, [despachar]);
+
+  useEffect(() => {
+    const id = setInterval(despachar, 2000);
+    return () => clearInterval(id);
+  }, [despachar]);
 
   const reiniciarFundo = useCallback((msg) => {
     ref.current.detector?.reiniciar();
     ref.current.movPendente = false;
-    ref.current.dardosVideo = [];
     if (msg) setStatus(msg);
   }, []);
 
@@ -124,8 +186,36 @@ export default function Camera() {
       try {
         const r = await fetch('/api/state', { cache: 'no-store' });
         const novo = await r.json();
-        if (vivo) setEstado(novo);
+        if (!vivo) return;
+        setEstado(novo);
+        registrarFaltas(novo);
       } catch { /* ignora */ }
+    };
+    // Ponto somado à mão no placar = dardo que a câmera não contou. Guarda o que
+    // a câmera estava vendo, para descobrir por quê.
+    const registrarFaltas = (est) => {
+      const r = ref.current;
+      const manuais = (est.historico || []).filter((h) => h.origem === 'manual' && h.id);
+      if (!r.manuaisVistos) {
+        r.manuaisVistos = new Set(manuais.map((h) => h.id)); // os antigos não contam
+        return;
+      }
+      for (const h of manuais) {
+        if (r.manuaisVistos.has(h.id)) continue;
+        r.manuaisVistos.add(h.id);
+        const det = r.detector;
+        if (!det?.estado.fundo || !r.ultimoImg) continue;
+        enviarRegistro({
+          id: `f-${h.id}`,
+          tipo: 'faltou',
+          meta: {
+            lance: h.id, pontos: h.pontos, anel: h.anel, geom: det.geom, limiar: r.limiar,
+            dardosNaMemoria: det.estado.dardos.length, versao: VERSAO,
+          },
+          antes: jpegDeRGB(det.estado.fundo, TAM_PROC),
+          depois: jpegDeImageData(r.ultimoImg),
+        });
+      }
     };
     buscar();
     const id = setInterval(buscar, 1500);
@@ -244,7 +334,21 @@ export default function Camera() {
           const marcos = res.landmarks?.[0];
           const temMao = !!marcos;
           setMaoAtiva(temMao);
-          if (temMao) ref.current.ultimaMao = Date.now();
+          if (temMao) {
+            // Mão longe do alvo (alguém fazendo o gesto de trocar jogador) não
+            // pausa a detecção; mão perto do alvo (tirando dardos) pausa.
+            const c = ref.current.calib;
+            let perto = true;
+            if (c && v.videoWidth) {
+              const xs = marcos.map((m) => m.x);
+              const ys = marcos.map((m) => m.y);
+              const A = Math.max(c.a, c.b) * 1.6;
+              const Ay = (A * v.videoWidth) / v.videoHeight;
+              perto = !(Math.max(...xs) < c.cx - A || Math.min(...xs) > c.cx + A ||
+                Math.max(...ys) < c.cy - Ay || Math.min(...ys) > c.cy + Ay);
+            }
+            if (perto) ref.current.ultimaMao = Date.now();
+          }
 
           const n = temMao ? contarDedos(marcos) : -1;
           setDedos(n < 0 ? 0 : n);
@@ -327,6 +431,8 @@ export default function Camera() {
       ctx.fillRect(0, 0, N, N);
       ctx.drawImage(v, sx, sy, lado, lado, 0, 0, N, N);
       const img = ctx.getImageData(0, 0, N, N);
+      r.ultimoImg = img;
+      r.recorte = { sx, sy, lado, vw, vh };
       extrairRGB(img, r.atual);
       borrar(r.atual, r.tmp, N, N);
 
@@ -357,22 +463,42 @@ export default function Camera() {
       // alvo balançou (dardo bateu?) mas nenhum dardo apareceu depois de assentar:
       // é o que acontece com dardo vermelho na mosca vermelha, que a câmera não enxerga
       const agoraMs = Date.now();
-      if (ev.tipo === 'movendo') {
+      if (ev.tipo === 'movendo' && ev.real) {
         r.movPendente = true;
         r.ultimoMov = agoraMs;
-      } else if (ev.tipo === 'mao' || ev.tipo === 'acerto' || ev.tipo === 'luz') {
+      } else if (['mao', 'acerto', 'luz', 'retirado'].includes(ev.tipo)) {
         r.movPendente = false;
       } else if (r.movPendente && ev.tipo === 'nada' && agoraMs - r.ultimoMov > AVISO_SEM_DARDO_MS) {
         r.movPendente = false;
         setStatus('Alvo mexeu mas não vi dardo — se foi na mosca, toque +200');
+        enviarRegistro({
+          id: novoId(),
+          tipo: 'sem-dardo',
+          meta: { geom: detector.geom, limiar: r.limiar, ruido: ev.ruido, ox: ev.ox, oy: ev.oy, versao: VERSAO },
+          antes: jpegDeRGB(detector.estado.fundo, N),
+          depois: jpegDeImageData(img),
+        });
         return;
       }
 
       if (ev.tipo === 'acerto') {
-        r.dardosVideo.push({ nx: (sx + (ev.x / N) * lado) / vw, ny: (sy + (ev.y / N) * lado) / vh });
-        enviar({ tipo: 'acerto', pontos: ev.pontos, anel: ev.anel, origem: 'camera' });
+        const id = novoId();
+        enviar({ id, tipo: 'acerto', pontos: ev.pontos, anel: ev.anel, origem: 'camera', registro: id });
+        enviarRegistro({
+          id,
+          tipo: 'acerto',
+          meta: {
+            pontos: ev.pontos, anel: ev.anel, dist: ev.dist, ponta: { x: ev.x, y: ev.y }, aletas: ev.aletas,
+            area: ev.area, comp: ev.comp, espessura: ev.espessura, ox: ev.ox, oy: ev.oy, ruido: ev.ruido,
+            geom: detector.geom, limiar: r.limiar, N, versao: VERSAO,
+          },
+          antes: jpegDeRGB(ev.fundoAntes, N),
+          depois: jpegDeImageData(img),
+        });
         setStatus(`${ev.anel}: ${ev.pontos} pts`);
         if (navigator.vibrate) navigator.vibrate(60);
+      } else if (ev.tipo === 'retirado') {
+        setStatus(ev.restantes ? `Dardo retirado (${ev.restantes} no alvo)` : 'Alvo limpo — dardos retirados');
       } else if (ev.tipo === 'nada' && raioPx < RAIO_MIN_PX) {
         setStatus('Alvo pequeno na imagem — aproxime o celular ou use o zoom');
       } else if (ev.tipo !== 'candidato' || ev.n === 1) {
@@ -405,8 +531,14 @@ export default function Camera() {
       ctx.clearRect(0, 0, rect.width, rect.height);
       if (!calib) return;
 
-      const cx = calib.cx * rect.width;
-      const cy = calib.cy * rect.height;
+      // o detector rastreia o alvo: os anéis acompanham onde ele está agora
+      const det = ref.current.detector;
+      const rc = ref.current.recorte;
+      const k = rc ? rc.lado / TAM_PROC : 0; // px do recorte → px do vídeo
+      const offX = det && rc ? (det.estado.ox * k) / rc.vw : 0;
+      const offY = det && rc ? (det.estado.oy * k) / rc.vh : 0;
+      const cx = (calib.cx + offX) * rect.width;
+      const cy = (calib.cy + offY) * rect.height;
       ctx.lineWidth = 2;
       for (const a of estado?.aneis || []) {
         ctx.strokeStyle = a.cor === '#1d1d1d' ? '#ffffff' : a.cor || '#f2c500';
@@ -436,9 +568,11 @@ export default function Camera() {
       }
       ctx.globalAlpha = 1;
       ctx.fillStyle = '#2fbf71';
-      for (const d of ref.current.dardosVideo) {
+      for (const d of det && rc ? det.estado.dardos : []) {
+        const nx = (rc.sx + (d.x + det.estado.ox) * k) / rc.vw;
+        const ny = (rc.sy + (d.y + det.estado.oy) * k) / rc.vh;
         ctx.beginPath();
-        ctx.arc(d.nx * rect.width, d.ny * rect.height, 6, 0, Math.PI * 2);
+        ctx.arc(nx * rect.width, ny * rect.height, 6, 0, Math.PI * 2);
         ctx.fill();
       }
     };
@@ -594,7 +728,10 @@ export default function Camera() {
           <span>
             Ruído: <b style={{ color: corRuido }}>{(ruido * 100).toFixed(1)}%</b>
           </span>
-          <span>Exposição: {trava || '—'}</span>
+          <span>
+            {pendentes > 0 && <b style={{ color: 'var(--amarelo)' }}>⏳ {pendentes} aguardando · </b>}
+            Exposição: {trava || '—'}
+          </span>
         </div>
         {erro && <div style={{ color: 'var(--vermelho)', fontSize: 13 }}>{erro}</div>}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>

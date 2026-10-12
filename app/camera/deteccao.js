@@ -249,17 +249,21 @@ export function mascaraDiferenca(atual, fundo, larg, alt, roi, limiar, mascara, 
   return { mudados, total };
 }
 
-// Procura o deslocamento (até maxD px) que melhor encaixa o quadro atual no fundo.
-export function melhorDeslocamento(atual, fundo, larg, alt, roi, maxD) {
-  let melhor = { ox: 0, oy: 0, erro: Infinity };
-  for (let oy = -maxD; oy <= maxD; oy++) {
-    for (let ox = -maxD; ox <= maxD; ox++) {
+// Procura o deslocamento que melhor encaixa o quadro atual no fundo, numa
+// janela de ±maxD px em volta de `centro` (rastreamento: parte de onde o alvo
+// estava). `passo` pula deslocamentos (busca grossa) e `amostra` pula pixels.
+export function melhorDeslocamento(atual, fundo, larg, alt, roi, maxD, centro = null, passo = 1, amostra = 3) {
+  const c0x = centro ? centro.ox : 0;
+  const c0y = centro ? centro.oy : 0;
+  let melhor = { ox: c0x, oy: c0y, erro: Infinity };
+  for (let oy = c0y - maxD; oy <= c0y + maxD; oy += passo) {
+    for (let ox = c0x - maxD; ox <= c0x + maxD; ox += passo) {
       let erro = 0;
       let n = 0;
-      for (let y = 0; y < alt; y += 3) {
+      for (let y = 0; y < alt; y += amostra) {
         const ya = y + oy;
         if (ya < 0 || ya >= alt) continue;
-        for (let x = 0; x < larg; x += 3) {
+        for (let x = 0; x < larg; x += amostra) {
           if (!roi[y * larg + x]) continue;
           const xa = x + ox;
           if (xa < 0 || xa >= larg) continue;
@@ -330,6 +334,69 @@ export function copiarRegiao(fundo, atual, larg, alt, ox, oy, pixels, margem = 2
     fundo[p + 1] = atual[q + 1];
     fundo[p + 2] = atual[q + 2];
   }
+}
+
+// Região de um dardo: os pixels da mancha + margem, como lista de índices.
+export function expandirRegiao(pixels, larg, alt, margem = 2) {
+  const marca = new Uint8Array(larg * alt);
+  for (const p of pixels) {
+    const x = p % larg;
+    const y = (p - x) / larg;
+    for (let yy = Math.max(0, y - margem); yy <= Math.min(alt - 1, y + margem); yy++) {
+      for (let xx = Math.max(0, x - margem); xx <= Math.min(larg - 1, x + margem); xx++) marca[yy * larg + xx] = 1;
+    }
+  }
+  const out = [];
+  for (let i = 0; i < marca.length; i++) if (marca[i]) out.push(i);
+  return Int32Array.from(out);
+}
+
+// Guarda os valores RGB de `img` nos pixels da região.
+export function amostrar(img, regiao) {
+  const out = new Float32Array(regiao.length * 3);
+  for (let k = 0; k < regiao.length; k++) {
+    const p = regiao[k] * 3;
+    out[k * 3] = img[p];
+    out[k * 3 + 1] = img[p + 1];
+    out[k * 3 + 2] = img[p + 2];
+  }
+  return out;
+}
+
+// Diferença média (maior canal) entre o quadro atual alinhado e uma amostra
+// guardada, com ganho de luz por canal aplicado à amostra.
+export function diferencaRegiao(atual, larg, alt, regiao, amostra, ox, oy, ganho = [1, 1, 1]) {
+  let soma = 0;
+  let n = 0;
+  for (let k = 0; k < regiao.length; k++) {
+    const i = regiao[k];
+    const xa = (i % larg) + ox;
+    const ya = Math.floor(i / larg) + oy;
+    if (xa < 0 || xa >= larg || ya < 0 || ya >= alt) continue;
+    const q = (ya * larg + xa) * 3;
+    soma += Math.max(
+      Math.abs(atual[q] - amostra[k * 3] * ganho[0]),
+      Math.abs(atual[q + 1] - amostra[k * 3 + 1] * ganho[1]),
+      Math.abs(atual[q + 2] - amostra[k * 3 + 2] * ganho[2])
+    );
+    n++;
+  }
+  return n ? soma / n : Infinity;
+}
+
+// Quanto a luz mudou desde que o dardo entrou: compara o fundo atual (que
+// acompanha a luz) com como o dardo era quando foi contado.
+function ganhoDeLuz(fundo, regiao, depois) {
+  const s = [0, 0, 0];
+  const d = [0, 0, 0];
+  for (let k = 0; k < regiao.length; k++) {
+    const p = regiao[k] * 3;
+    for (let c = 0; c < 3; c++) {
+      s[c] += fundo[p + c];
+      d[c] += depois[k * 3 + c];
+    }
+  }
+  return s.map((v, c) => (d[c] > 1 ? Math.min(2, Math.max(0.5, v / d[c])) : 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -488,7 +555,8 @@ export const CONFIG_PADRAO = {
   framesAquecimento: 12,   // ~2s para exposição/foco assentarem
   movimento: 0.02,         // >2% mudou entre dois quadros = alvo balançando
   framesParado: 3,         // quadros parados antes de voltar a analisar
-  deslocMax: 8,            // quanto o alvo pode ter assentado fora do lugar (px)
+  deslocMax: 2,            // ajuste fino quadro a quadro em volta da posição rastreada (px)
+  deslocBalanco: 24,       // depois de balançar, procura o alvo nessa janela (px)
   mudancaGlobal: 0.035,    // >3,5% diferente do fundo mesmo alinhado…
   framesLuz: 10,           // …por ~1,5s seguidos = luz mudou: troca o fundo
   adaptaFundo: 0.04,       // velocidade com que o fundo segue a luz lenta
@@ -520,17 +588,37 @@ export function criarDetector(N, geom, config = {}) {
     aquecendo: 0,
     parado: 0,
     luz: 0,
-    dardos: [],
+    dardos: [],        // memória por dardo: { x, y, regiao, antes, depois, area }
+    dono: new Int16Array(N * N).fill(-1), // qual dardo ocupa cada pixel
     candidato: null,
     ultimoAcerto: -Infinity,
+    ox: 0,             // posição rastreada do alvo em relação à calibração
+    oy: 0,
+    procurarLonge: true,
   };
 
   function reiniciar() {
     s.fundo = null;
     s.anterior = null;
     s.dardos = [];
+    s.dono.fill(-1);
     s.candidato = null;
     s.luz = 0;
+    s.ox = 0;
+    s.oy = 0;
+    s.procurarLonge = true;
+  }
+
+  function refazerDonos() {
+    s.dono.fill(-1);
+    s.dardos.forEach((d, j) => { for (const i of d.regiao) s.dono[i] = j; });
+  }
+
+  // tira um dardo da memória e passa a considerar o alvo vazio naquela região
+  function retirar(j, atual, ox, oy) {
+    copiarRegiao(s.fundo, atual, N, N, ox, oy, s.dardos[j].regiao, 0);
+    s.dardos.splice(j, 1);
+    refazerDonos();
   }
 
   // atual: Float32Array RGB N×N já desfocado. Retorna o que aconteceu.
@@ -557,11 +645,12 @@ export function criarDetector(N, geom, config = {}) {
     if (fracMov > cfg.movimento) {
       s.parado = 0;
       s.candidato = null;
-      return { tipo: 'movendo', ruido: fracMov };
+      s.procurarLonge = true; // balançou: pode ter assentado em outro lugar
+      return { tipo: 'movendo', real: true, ruido: fracMov };
     }
     if (s.parado < cfg.framesParado) {
       s.parado++;
-      return { tipo: 'movendo', ruido: fracMov };
+      return { tipo: 'movendo', real: false, ruido: fracMov }; // só esperando assentar
     }
 
     // 2) mão na frente do alvo: nada é dardo
@@ -570,8 +659,38 @@ export function criarDetector(N, geom, config = {}) {
       return { tipo: 'mao' };
     }
 
-    // 3) alinha com o fundo (o alvo pode ter assentado alguns px ao lado)
-    const { ox, oy } = melhorDeslocamento(atual, s.fundo, N, N, roi, cfg.deslocMax);
+    // 3) rastreia o alvo: depois de balançar procura numa janela grande (busca
+    //    grossa), depois só ajusta fino em volta de onde ele estava
+    let centroBusca = { ox: s.ox, oy: s.oy };
+    if (s.procurarLonge) {
+      centroBusca = melhorDeslocamento(atual, s.fundo, N, N, roi, cfg.deslocBalanco, { ox: 0, oy: 0 }, 3, 4);
+      s.procurarLonge = false;
+    }
+    const fino = melhorDeslocamento(atual, s.fundo, N, N, roi, cfg.deslocMax, centroBusca);
+    const lim = cfg.deslocBalanco;
+    const ox = Math.max(-lim, Math.min(lim, fino.ox));
+    const oy = Math.max(-lim, Math.min(lim, fino.oy));
+    s.ox = ox;
+    s.oy = oy;
+
+    // 4) memória por dardo: algum dardo contado foi retirado? (a região voltou
+    //    a parecer o alvo de antes dele, com a correção de luz)
+    let retirados = 0;
+    for (let j = s.dardos.length - 1; j >= 0; j--) {
+      const d = s.dardos[j];
+      const ganho = ganhoDeLuz(s.fundo, d.regiao, d.depois);
+      const comoAntes = diferencaRegiao(atual, N, N, d.regiao, d.antes, ox, oy, ganho);
+      const comoDepois = diferencaRegiao(atual, N, N, d.regiao, d.depois, ox, oy, ganho);
+      if (comoAntes < limiar * 0.5 && comoDepois > limiar * 0.5 && comoAntes < comoDepois * 0.6) {
+        retirar(j, atual, ox, oy);
+        retirados++;
+      }
+    }
+    if (retirados) {
+      s.candidato = null;
+      return { tipo: 'retirado', n: retirados, restantes: s.dardos.length, ox, oy };
+    }
+
     const { mudados, total } = mascaraDiferenca(atual, s.fundo, N, N, roi, limiar, mascara, ox, oy);
     const ruido = total ? mudados / total : 0;
 
@@ -587,7 +706,7 @@ export function criarDetector(N, geom, config = {}) {
     s.luz = 0;
     adaptarFundo(s.fundo, atual, mascara, cfg.adaptaFundo, N, ox, oy);
 
-    // 4) mancha com tamanho de dardo cuja ponta ainda não foi pontuada
+    // 5) mancha com tamanho de dardo que não seja um dardo já contado
     const lista = manchas(mascara, N, N, areaMin, areaMax, geom.dir || null);
     const maiorArea = lista[0]?.area || 0;
     const info = { ruido, ox, oy, maiorArea, areaMin };
@@ -597,7 +716,28 @@ export function criarDetector(N, geom, config = {}) {
       if (m.comp < compMin) continue;           // curto demais para um dardo deitado
       const { ponta, aletas } = escolherPonta(m);
       if (distElipse(geom, ponta.x, ponta.y) > 1.02) continue; // ponta fora do preto
-      if (s.dardos.some((d) => Math.hypot(d.x - ponta.x, d.y - ponta.y) < raio * 0.1)) continue;
+
+      // É o "fantasma" de um dardo já contado? Só se ocupa praticamente a mesma
+      // região, com a mesma ponta e tamanho parecido. Um dardo NOVO caindo ao
+      // lado (agrupado) ocupa outros pixels e passa.
+      const contagem = new Map();
+      for (const i of m.pixels) if (s.dono[i] >= 0) contagem.set(s.dono[i], (contagem.get(s.dono[i]) || 0) + 1);
+      let fantasma = false;
+      for (const [j, c] of contagem) {
+        const d = s.dardos[j];
+        const sobrepoe = c / m.pixels.length;
+        const mesmaPonta = Math.hypot(d.x - ponta.x, d.y - ponta.y) < raio * 0.05;
+        const mesmoTamanho = m.area > d.area * 0.7 && m.area < d.area * 1.4;
+        if (sobrepoe > 0.6 && mesmaPonta && mesmoTamanho) {
+          const ganho = ganhoDeLuz(s.fundo, d.regiao, d.depois);
+          const aindaLa = diferencaRegiao(atual, N, N, d.regiao, d.depois, ox, oy, ganho) < limiar * 0.5;
+          copiarRegiao(s.fundo, atual, N, N, ox, oy, m.pixels);
+          if (!aindaLa) retirar(j, atual, ox, oy); // não parece mais o dardo: foi tirado
+          fantasma = true;
+          break;
+        }
+      }
+      if (fantasma) continue;
       novo = { ...m, ponta, aletas };
       break;
     }
@@ -622,13 +762,18 @@ export function criarDetector(N, geom, config = {}) {
     for (const a of [...(aneis || [])].sort((x, y) => x.raio - y.raio)) {
       if (dist <= a.raio) { pontos = a.pontos; anel = a.nome; break; }
     }
-    s.dardos.push({ x: p.x, y: p.y });
+    const regiao = expandirRegiao(novo.pixels, N, N, 2);
+    const fundoAntes = Float32Array.from(s.fundo);                 // para a caixa-preta
+    const antes = amostrar(s.fundo, regiao);                       // alvo sem o dardo
+    copiarRegiao(s.fundo, atual, N, N, ox, oy, regiao, 0);         // só ESTE dardo vira fundo
+    const depois = amostrar(s.fundo, regiao);                      // alvo com o dardo
+    s.dardos.push({ x: p.x, y: p.y, regiao, antes, depois, area: novo.area });
+    refazerDonos();
     s.candidato = null;
     s.ultimoAcerto = agora;
-    copiarRegiao(s.fundo, atual, N, N, ox, oy, novo.pixels); // só ESTE dardo vira fundo
     return {
       tipo: 'acerto', x: p.x, y: p.y, aletas: novo.aletas, dist, pontos, anel,
-      area: novo.area, comp: novo.comp, espessura: novo.espessura, ...info,
+      area: novo.area, comp: novo.comp, espessura: novo.espessura, fundoAntes, ...info,
     };
   }
 
