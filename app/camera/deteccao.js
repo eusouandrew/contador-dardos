@@ -1,5 +1,7 @@
-// Utilitários de visão: diferença de quadros em cor + componentes conexos.
+// Visão do contador de dardos.
 // As imagens são Float32Array intercalados RGB (3 valores por pixel).
+// O alvo é descrito por uma elipse { cx, cy, a, b, ang }: centro, semi-eixos da
+// borda do círculo preto e inclinação — com o celular de lado o círculo vira elipse.
 
 export function extrairRGB(imageData, saida) {
   const d = imageData.data;
@@ -39,26 +41,198 @@ export function borrar(img, tmp, larg, alt) {
   return img;
 }
 
-// Marca os pixels que mudaram em relação ao fundo dentro do círculo.
-// Usa a maior diferença entre os canais: dardo laranja sobre a mosca vermelha
-// quase não muda em cinza, mas muda bastante no verde.
-// (ox, oy) desloca o quadro atual para compensar o alvo que balançou.
-export function mascaraDiferenca(atual, fundo, larg, alt, centro, raioMax, limiar, mascara, ox = 0, oy = 0) {
+export function brilhoMedio(img) {
+  let s = 0;
+  for (let p = 0; p < img.length; p += 3) s += img[p] + img[p + 1] + img[p + 2];
+  return s / img.length;
+}
+
+// Distância normalizada até o centro: 1 = borda do círculo preto.
+export function distElipse(g, x, y) {
+  const dx = x - g.cx;
+  const dy = y - g.cy;
+  const c = Math.cos(g.ang);
+  const s = Math.sin(g.ang);
+  const u = (dx * c + dy * s) / g.a;
+  const v = (-dx * s + dy * c) / g.b;
+  return Math.sqrt(u * u + v * v);
+}
+
+// Pixels do recorte que pertencem à região analisada.
+export function mascaraRegiao(g, larg, alt, limite) {
+  const roi = new Uint8Array(larg * alt);
+  for (let y = 0; y < alt; y++) {
+    for (let x = 0; x < larg; x++) {
+      if (distElipse(g, x, y) <= limite) roi[y * larg + x] = 1;
+    }
+  }
+  return roi;
+}
+
+// ---------------------------------------------------------------------------
+// Calibração automática: a partir de um toque no centro, encontra o disco
+// amarelo+vermelho (cercado pelo preto) e ajusta uma elipse pelos momentos.
+
+function quente(r, g, b) {
+  // amarelo, laranja ou vermelho bem saturados
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  if (max < 70) return false;
+  const sat = (max - min) / max;
+  if (sat < 0.4) return false;
+  let h;
+  if (max === r) h = (60 * ((g - b) / (max - min)) + 360) % 360;
+  else if (max === g) h = 60 * ((b - r) / (max - min)) + 120;
+  else h = 60 * ((r - g) / (max - min)) + 240;
+  return h <= 75 || h >= 330;
+}
+
+function dilatarBin(m, saida, larg, alt) {
+  saida.fill(0);
+  for (let y = 0; y < alt; y++) {
+    for (let x = 0; x < larg; x++) {
+      if (!m[y * larg + x]) continue;
+      for (let yy = Math.max(0, y - 1); yy <= Math.min(alt - 1, y + 1); yy++) {
+        for (let xx = Math.max(0, x - 1); xx <= Math.min(larg - 1, x + 1); xx++) saida[yy * larg + xx] = 1;
+      }
+    }
+  }
+  return saida;
+}
+
+function erodirBin(m, saida, larg, alt) {
+  saida.fill(0);
+  for (let y = 1; y < alt - 1; y++) {
+    for (let x = 1; x < larg - 1; x++) {
+      let ok = 1;
+      for (let yy = y - 1; yy <= y + 1 && ok; yy++) {
+        for (let xx = x - 1; xx <= x + 1; xx++) if (!m[yy * larg + xx]) { ok = 0; break; }
+      }
+      saida[y * larg + x] = ok;
+    }
+  }
+  return saida;
+}
+
+function inundar(m, larg, alt, ini, marca) {
+  const fila = new Int32Array(larg * alt);
+  let a = 0;
+  let f = 0;
+  fila[f++] = ini;
+  marca[ini] = 1;
+  while (a < f) {
+    const p = fila[a++];
+    const x = p % larg;
+    const viz = [x > 0 ? p - 1 : -1, x < larg - 1 ? p + 1 : -1, p - larg, p + larg];
+    for (const q of viz) {
+      if (q < 0 || q >= m.length || marca[q] || !m[q]) continue;
+      marca[q] = 1;
+      fila[f++] = q;
+    }
+  }
+  return f;
+}
+
+// img: RGB já desfocado (larg×alt). (sx, sy): toque no centro, em pixels.
+// razaoAmarelo: raio da borda externa do amarelo / raio da borda do preto.
+// Retorna a elipse da borda do preto, ou null se não achou o alvo.
+export function ajustarAlvo(img, larg, alt, sx, sy, razaoAmarelo = 0.57) {
+  const n = larg * alt;
+  let m = new Uint8Array(n);
+  for (let i = 0, p = 0; i < n; i++, p += 3) m[i] = quente(img[p], img[p + 1], img[p + 2]) ? 1 : 0;
+
+  // fecha os buracos entre os pinos
+  const t1 = new Uint8Array(n);
+  const t2 = new Uint8Array(n);
+  dilatarBin(dilatarBin(m, t1, larg, alt), t2, larg, alt);
+  erodirBin(erodirBin(t2, t1, larg, alt), m, larg, alt);
+
+  // semente: pixel "quente" mais perto do toque
+  let ini = -1;
+  for (let r = 0; r < 25 && ini < 0; r++) {
+    for (let dy = -r; dy <= r && ini < 0; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const x = Math.round(sx + dx);
+        const y = Math.round(sy + dy);
+        if (x < 0 || y < 0 || x >= larg || y >= alt) continue;
+        if (m[y * larg + x]) { ini = y * larg + x; break; }
+      }
+    }
+  }
+  if (ini < 0) return null;
+
+  const regiao = new Uint8Array(n);
+  const area = inundar(m, larg, alt, ini, regiao);
+  if (area < 150 || area > n * 0.5) return null;
+
+  // tapa os furos (dardos azuis em cima do amarelo): tudo que não se liga à
+  // borda da imagem por fora da região faz parte do disco
+  const fora = new Uint8Array(n);
+  const livre = new Uint8Array(n);
+  for (let i = 0; i < n; i++) livre[i] = regiao[i] ? 0 : 1;
+  for (let x = 0; x < larg; x++) {
+    for (const i of [x, (alt - 1) * larg + x]) if (livre[i] && !fora[i]) inundar(livre, larg, alt, i, fora);
+  }
+  for (let y = 0; y < alt; y++) {
+    for (const i of [y * larg, y * larg + larg - 1]) if (livre[i] && !fora[i]) inundar(livre, larg, alt, i, fora);
+  }
+
+  let s = 0, mx = 0, my = 0;
+  for (let i = 0; i < n; i++) {
+    if (fora[i]) continue;
+    s++;
+    mx += i % larg;
+    my += Math.floor(i / larg);
+  }
+  mx /= s;
+  my /= s;
+  let sxx = 0, syy = 0, sxy = 0;
+  for (let i = 0; i < n; i++) {
+    if (fora[i]) continue;
+    const dx = (i % larg) - mx;
+    const dy = Math.floor(i / larg) - my;
+    sxx += dx * dx;
+    syy += dy * dy;
+    sxy += dx * dy;
+  }
+  sxx /= s;
+  syy /= s;
+  sxy /= s;
+
+  // autovalores da covariância: disco cheio de semi-eixo a tem variância a²/4
+  const tr = sxx + syy;
+  const det = sxx * syy - sxy * sxy;
+  const disc = Math.sqrt(Math.max(0, (tr * tr) / 4 - det));
+  const l1 = tr / 2 + disc;
+  const l2 = tr / 2 - disc;
+  const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  const a = (2 * Math.sqrt(l1)) / razaoAmarelo;
+  const b = (2 * Math.sqrt(Math.max(l2, 1e-6))) / razaoAmarelo;
+  if (b / a < 0.35) return null; // achatado demais: não é o alvo
+
+  return { cx: mx, cy: my, a, b, ang, area: s };
+}
+
+// ---------------------------------------------------------------------------
+// Diferença de quadros
+
+// Marca os pixels da região que mudaram em relação ao fundo.
+// Usa a maior diferença entre os canais (dardo laranja sobre a mosca vermelha
+// quase não muda em cinza, mas muda no verde). (ox, oy) compensa o alvo que
+// balançou: compara atual[x+ox, y+oy] com fundo[x, y].
+export function mascaraDiferenca(atual, fundo, larg, alt, roi, limiar, mascara, ox = 0, oy = 0) {
   let mudados = 0;
   let total = 0;
   mascara.fill(0);
-  const r2 = raioMax * raioMax;
   for (let y = 0; y < alt; y++) {
-    const dy = y - centro.y;
     const ya = y + oy;
     if (ya < 0 || ya >= alt) continue;
     for (let x = 0; x < larg; x++) {
-      const dx = x - centro.x;
-      if (dx * dx + dy * dy > r2) continue;
+      const i = y * larg + x;
+      if (!roi[i]) continue;
       const xa = x + ox;
       if (xa < 0 || xa >= larg) continue;
       total++;
-      const i = y * larg + x;
       const p = i * 3;
       const q = (ya * larg + xa) * 3;
       const dif = Math.max(
@@ -75,11 +249,9 @@ export function mascaraDiferenca(atual, fundo, larg, alt, centro, raioMax, limia
   return { mudados, total };
 }
 
-// Procura o deslocamento (até maxD px) que melhor encaixa o quadro atual no
-// fundo. Compara uma amostra de pixels do círculo para ser barato.
-export function melhorDeslocamento(atual, fundo, larg, alt, centro, raio, maxD) {
+// Procura o deslocamento (até maxD px) que melhor encaixa o quadro atual no fundo.
+export function melhorDeslocamento(atual, fundo, larg, alt, roi, maxD) {
   let melhor = { ox: 0, oy: 0, erro: Infinity };
-  const r2 = raio * raio;
   for (let oy = -maxD; oy <= maxD; oy++) {
     for (let ox = -maxD; ox <= maxD; ox++) {
       let erro = 0;
@@ -87,10 +259,8 @@ export function melhorDeslocamento(atual, fundo, larg, alt, centro, raio, maxD) 
       for (let y = 0; y < alt; y += 3) {
         const ya = y + oy;
         if (ya < 0 || ya >= alt) continue;
-        const dy = y - centro.y;
         for (let x = 0; x < larg; x += 3) {
-          const dx = x - centro.x;
-          if (dx * dx + dy * dy > r2) continue;
+          if (!roi[y * larg + x]) continue;
           const xa = x + ox;
           if (xa < 0 || xa >= larg) continue;
           const p = (y * larg + x) * 3;
@@ -108,21 +278,16 @@ export function melhorDeslocamento(atual, fundo, larg, alt, centro, raio, maxD) 
   return melhor;
 }
 
-// Puxa o fundo devagar para o quadro atual onde nada mudou de verdade,
-// absorvendo variações lentas de luz sem engolir um dardo novo.
-export function adaptarFundo(fundo, atual, mascara, taxa, larg = 0, ox = 0, oy = 0) {
-  const alt = larg ? mascara.length / larg : 0;
+// Puxa o fundo devagar para o quadro atual onde nada mudou de verdade.
+export function adaptarFundo(fundo, atual, mascara, taxa, larg, ox = 0, oy = 0) {
+  const alt = mascara.length / larg;
   for (let i = 0; i < mascara.length; i++) {
     if (mascara[i]) continue;
-    let q = i;
-    if (ox || oy) {
-      const x = (i % larg) + ox;
-      const y = Math.floor(i / larg) + oy;
-      if (x < 0 || x >= larg || y < 0 || y >= alt) continue;
-      q = y * larg + x;
-    }
+    const x = (i % larg) + ox;
+    const y = Math.floor(i / larg) + oy;
+    if (x < 0 || x >= larg || y < 0 || y >= alt) continue;
     const p = i * 3;
-    q *= 3;
+    const q = (y * larg + x) * 3;
     fundo[p] += (atual[q] - fundo[p]) * taxa;
     fundo[p + 1] += (atual[q + 1] - fundo[p + 1]) * taxa;
     fundo[p + 2] += (atual[q + 2] - fundo[p + 2]) * taxa;
@@ -144,14 +309,46 @@ export function copiarAlinhado(fundo, atual, larg, alt, ox, oy) {
   }
 }
 
-export function brilhoMedio(img) {
-  let s = 0;
-  for (let p = 0; p < img.length; p += 3) s += img[p] + img[p + 1] + img[p + 2];
-  return s / img.length;
+// Copia para o fundo só os pixels indicados (e uma margem de `margem` px):
+// incorpora um dardo confirmado sem engolir outro que ainda está chegando.
+export function copiarRegiao(fundo, atual, larg, alt, ox, oy, pixels, margem = 2) {
+  const marca = new Uint8Array(larg * alt);
+  for (const p of pixels) {
+    const x = p % larg;
+    const y = (p - x) / larg;
+    for (let yy = Math.max(0, y - margem); yy <= Math.min(alt - 1, y + margem); yy++) {
+      for (let xx = Math.max(0, x - margem); xx <= Math.min(larg - 1, x + margem); xx++) marca[yy * larg + xx] = 1;
+    }
+  }
+  for (let i = 0; i < marca.length; i++) {
+    if (!marca[i]) continue;
+    const xa = Math.min(larg - 1, Math.max(0, (i % larg) + ox));
+    const ya = Math.min(alt - 1, Math.max(0, Math.floor(i / larg) + oy));
+    const p = i * 3;
+    const q = (ya * larg + xa) * 3;
+    fundo[p] = atual[q];
+    fundo[p + 1] = atual[q + 1];
+    fundo[p + 2] = atual[q + 2];
+  }
 }
 
-// Agrupa pixels vizinhos em blobs (BFS 4-vizinhos).
-export function blobs(mascara, larg, alt, areaMin, areaMax) {
+// ---------------------------------------------------------------------------
+// Manchas e ponta do dardo
+
+// Agrupa pixels vizinhos. Os grupos são formados na máscara dilatada (junta
+// aletas e haste que apareceram separadas), mas as medidas usam só os pixels
+// que mudaram de verdade. Para cada mancha devolve as duas extremidades do eixo
+// comprido e a largura perto de cada uma: as aletas são largas, a ponta é fina.
+export function manchas(mascara, larg, alt, areaMin, areaMax, dir = null, dilatacoes = 2) {
+  let juntar = mascara;
+  const t1 = new Uint8Array(mascara.length);
+  const t2 = new Uint8Array(mascara.length);
+  for (let k = 0; k < dilatacoes; k++) {
+    const saida = k % 2 === 0 ? t1 : t2;
+    dilatarBin(juntar, saida, larg, alt);
+    juntar = saida;
+  }
+
   const visto = new Uint8Array(mascara.length);
   const fila = new Int32Array(mascara.length);
   const achados = [];
@@ -161,26 +358,112 @@ export function blobs(mascara, larg, alt, areaMin, areaMax) {
     let fim = 0;
     fila[fim++] = i;
     visto[i] = 1;
-    let soma = 0;
-    let somaX = 0;
-    let somaY = 0;
     while (ini < fim) {
       const p = fila[ini++];
       const x = p % larg;
       const y = (p - x) / larg;
-      soma++;
-      somaX += x;
-      somaY += y;
-      if (x > 0 && mascara[p - 1] && !visto[p - 1]) { visto[p - 1] = 1; fila[fim++] = p - 1; }
-      if (x < larg - 1 && mascara[p + 1] && !visto[p + 1]) { visto[p + 1] = 1; fila[fim++] = p + 1; }
-      if (y > 0 && mascara[p - larg] && !visto[p - larg]) { visto[p - larg] = 1; fila[fim++] = p - larg; }
-      if (y < alt - 1 && mascara[p + larg] && !visto[p + larg]) { visto[p + larg] = 1; fila[fim++] = p + larg; }
+      if (x > 0 && juntar[p - 1] && !visto[p - 1]) { visto[p - 1] = 1; fila[fim++] = p - 1; }
+      if (x < larg - 1 && juntar[p + 1] && !visto[p + 1]) { visto[p + 1] = 1; fila[fim++] = p + 1; }
+      if (y > 0 && juntar[p - larg] && !visto[p - larg]) { visto[p - larg] = 1; fila[fim++] = p - larg; }
+      if (y < alt - 1 && juntar[p + larg] && !visto[p + larg]) { visto[p + larg] = 1; fila[fim++] = p + larg; }
     }
-    if (soma >= areaMin && soma <= areaMax) {
-      achados.push({ area: soma, x: somaX / soma, y: somaY / soma });
+
+    // só os pixels que mudaram de verdade
+    const xs = [];
+    const ys = [];
+    for (let k = 0; k < fim; k++) {
+      const p = fila[k];
+      if (!mascara[p]) continue;
+      xs.push(p % larg);
+      ys.push(Math.floor(p / larg));
     }
+    const area = xs.length;
+    if (area < areaMin || area > areaMax) continue;
+    const m = medirMancha(xs, ys, dir);
+    m.pixels = fila.slice(0, fim);
+    achados.push(m);
   }
   return achados.sort((a, b) => b.area - a.area);
+}
+
+function medirMancha(xs, ys, dir) {
+  const n = xs.length;
+  let mx = 0, my = 0;
+  for (let k = 0; k < n; k++) { mx += xs[k]; my += ys[k]; }
+  mx /= n;
+  my /= n;
+  let sxx = 0, syy = 0, sxy = 0;
+  for (let k = 0; k < n; k++) {
+    const dx = xs[k] - mx;
+    const dy = ys[k] - my;
+    sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+  }
+  sxx /= n; syy /= n; sxy /= n;
+  const tr = sxx + syy;
+  const disc = Math.sqrt(Math.max(0, (tr * tr) / 4 - (sxx * syy - sxy * sxy)));
+  const l1 = tr / 2 + disc;
+  const l2 = Math.max(tr / 2 - disc, 0.01);
+
+  // eixo de medida: a direção ponta→aletas da calibração; sem ela, o eixo comprido
+  let ux, uy;
+  if (dir) {
+    ux = dir.x;
+    uy = dir.y;
+  } else {
+    const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+    ux = Math.cos(ang);
+    uy = Math.sin(ang);
+  }
+
+  let tmin = Infinity, tmax = -Infinity;
+  const ts = new Float32Array(n);
+  for (let k = 0; k < n; k++) {
+    ts[k] = (xs[k] - mx) * ux + (ys[k] - my) * uy;
+    if (ts[k] < tmin) tmin = ts[k];
+    if (ts[k] > tmax) tmax = ts[k];
+  }
+  const comp = tmax - tmin;
+
+  // extremidade (média dos pixels nos 12% finais) e largura nos 30% finais
+  const ponta = (de, ate) => {
+    let sx = 0, sy = 0, c = 0;
+    for (let k = 0; k < n; k++) if (ts[k] >= de && ts[k] <= ate) { sx += xs[k]; sy += ys[k]; c++; }
+    return c ? { x: sx / c, y: sy / c } : { x: mx, y: my };
+  };
+  const largura = (de, ate) => {
+    let s1 = 0, s2 = 0, c = 0;
+    for (let k = 0; k < n; k++) {
+      if (ts[k] < de || ts[k] > ate) continue;
+      const w = -(xs[k] - mx) * uy + (ys[k] - my) * ux;
+      s1 += w; s2 += w * w; c++;
+    }
+    return c ? Math.sqrt(Math.max(0, s2 / c - (s1 / c) ** 2)) : 0;
+  };
+
+  return {
+    area: n,
+    x: mx,
+    y: my,
+    comp,
+    espessura: Math.sqrt(l2),          // desvio no eixo curto: linhas finas = borda/pinos
+    alongamento: Math.sqrt(l1 / l2),
+    porDirecao: !!dir,
+    e1: ponta(tmin, tmin + 0.12 * comp), // com dir: lado da ponta
+    e2: ponta(tmax - 0.12 * comp, tmax), // com dir: lado das aletas
+    w1: largura(tmin, tmin + 0.3 * comp),
+    w2: largura(tmax - 0.3 * comp, tmax),
+  };
+}
+
+// Decide qual extremidade é a ponta.
+// Com a direção da calibração (celular de lado) é direto: a ponta é a
+// extremidade oposta às aletas. Sem ela (celular de frente) o dardo aparece
+// curto e o centro da mancha já está perto da ponta.
+export function escolherPonta(m) {
+  if (m.porDirecao) return { ponta: m.e1, aletas: m.e2 };
+  if (m.alongamento < 1.8) return { ponta: { x: m.x, y: m.y }, aletas: null };
+  const e1EPonta = m.w2 >= m.w1; // aletas são o lado mais largo
+  return e1EPonta ? { ponta: m.e1, aletas: m.e2 } : { ponta: m.e2, aletas: m.e1 };
 }
 
 // Quantos dedos (indicador→mínimo) estão estendidos.
@@ -199,9 +482,9 @@ export function contarDedos(marcos) {
 // testes rodarem exatamente o mesmo código.
 
 export const CONFIG_PADRAO = {
-  folga: 1.12,             // o recorte cobre 1,12× o raio do alvo
-  raioUtil: 1.06,          // fora disso é borda amarela (0 pts): nem olha
-  framesEstaveis: 5,       // ~0,75s com o mesmo blob parado
+  folga: 1.25,             // o recorte cobre 1,25× o semi-eixo maior (cabe a aleta pra fora)
+  raioUtil: 1.08,          // região analisada, em raios do círculo preto
+  framesEstaveis: 5,       // ~0,75s com a mesma ponta parada
   framesAquecimento: 12,   // ~2s para exposição/foco assentarem
   movimento: 0.02,         // >2% mudou entre dois quadros = alvo balançando
   framesParado: 3,         // quadros parados antes de voltar a analisar
@@ -212,12 +495,22 @@ export const CONFIG_PADRAO = {
   pausaEntreDardosMs: 1200,
 };
 
-export function criarDetector(N, config = {}) {
+// geom: elipse do alvo nas coordenadas do recorte N×N, com geom.dir = direção
+// ponta→aletas (vetor unitário) quando o celular está de lado.
+export function criarDetector(N, geom, config = {}) {
   const cfg = { ...CONFIG_PADRAO, ...config };
-  const centro = { x: N / 2, y: N / 2 };
-  const raio = N / 2 / cfg.folga;
-  const areaMin = Math.max(10, Math.round(raio * raio * 0.002));
-  const areaMax = Math.round(raio * raio * 0.06);
+  const raio = Math.sqrt(geom.a * geom.b);
+  // Medido nas capturas reais: um dardo ocupa ~0,044 R² e mede ~0,36 R ao longo
+  // da direção em que "deita"; os pinos da lateral que mudam quando o alvo
+  // assenta torto dão ~0,009 R² e ~0,11 R. Os limites ficam no meio.
+  // De frente o dardo aparece de ponta (só a cruz das aletas, ~0,007 R²).
+  const areaMin = Math.max(12, Math.round(raio * raio * (geom.dir ? 0.015 : 0.004)));
+  const espessuraMin = Math.max(0.9, raio * 0.012);
+  // o comprimento aparente do dardo cresce com o ângulo do celular
+  const inclinacao = Math.sqrt(Math.max(0, 1 - (Math.min(geom.a, geom.b) / Math.max(geom.a, geom.b)) ** 2));
+  const compMin = geom.dir ? raio * Math.max(0.08, 0.3 * inclinacao) : 0;
+  const areaMax = Math.round(raio * raio * 0.12);
+  const roi = mascaraRegiao(geom, N, N, cfg.raioUtil);
   const mascara = new Uint8Array(N * N);
   const mascaraMov = new Uint8Array(N * N);
 
@@ -258,7 +551,7 @@ export function criarDetector(N, config = {}) {
     }
 
     // 1) o alvo está se mexendo? (compara com o quadro anterior)
-    const mov = mascaraDiferenca(atual, s.anterior, N, N, centro, raio * cfg.raioUtil, limiar, mascaraMov);
+    const mov = mascaraDiferenca(atual, s.anterior, N, N, roi, limiar, mascaraMov);
     s.anterior.set(atual);
     const fracMov = mov.total ? mov.mudados / mov.total : 0;
     if (fracMov > cfg.movimento) {
@@ -278,10 +571,8 @@ export function criarDetector(N, config = {}) {
     }
 
     // 3) alinha com o fundo (o alvo pode ter assentado alguns px ao lado)
-    const { ox, oy } = melhorDeslocamento(atual, s.fundo, N, N, centro, raio, cfg.deslocMax);
-    const { mudados, total } = mascaraDiferenca(
-      atual, s.fundo, N, N, centro, raio * cfg.raioUtil, limiar, mascara, ox, oy
-    );
+    const { ox, oy } = melhorDeslocamento(atual, s.fundo, N, N, roi, cfg.deslocMax);
+    const { mudados, total } = mascaraDiferenca(atual, s.fundo, N, N, roi, limiar, mascara, ox, oy);
     const ruido = total ? mudados / total : 0;
 
     if (ruido > cfg.mudancaGlobal) {
@@ -296,39 +587,50 @@ export function criarDetector(N, config = {}) {
     s.luz = 0;
     adaptarFundo(s.fundo, atual, mascara, cfg.adaptaFundo, N, ox, oy);
 
-    // 4) blob com tamanho de dardo que ainda não foi pontuado
-    const lista = blobs(mascara, N, N, areaMin, areaMax);
+    // 4) mancha com tamanho de dardo cuja ponta ainda não foi pontuada
+    const lista = manchas(mascara, N, N, areaMin, areaMax, geom.dir || null);
     const maiorArea = lista[0]?.area || 0;
-    const novo = lista.find(
-      (b) => !s.dardos.some((d) => Math.hypot(d.x - b.x, d.y - b.y) < raio * 0.1)
-    );
     const info = { ruido, ox, oy, maiorArea, areaMin };
+    let novo = null;
+    for (const m of lista) {
+      if (m.espessura < espessuraMin) continue; // linha fina: borda da placa ou pinos
+      if (m.comp < compMin) continue;           // curto demais para um dardo deitado
+      const { ponta, aletas } = escolherPonta(m);
+      if (distElipse(geom, ponta.x, ponta.y) > 1.02) continue; // ponta fora do preto
+      if (s.dardos.some((d) => Math.hypot(d.x - ponta.x, d.y - ponta.y) < raio * 0.1)) continue;
+      novo = { ...m, ponta, aletas };
+      break;
+    }
     if (!novo) {
       s.candidato = null;
       return { tipo: 'nada', ...info };
     }
-    if (s.candidato && Math.hypot(s.candidato.x - novo.x, s.candidato.y - novo.y) < raio * 0.04) {
+    const p = novo.ponta;
+    if (s.candidato && Math.hypot(s.candidato.x - p.x, s.candidato.y - p.y) < raio * 0.05) {
       s.candidato.n += 1;
     } else {
-      s.candidato = { x: novo.x, y: novo.y, n: 1 };
+      s.candidato = { x: p.x, y: p.y, n: 1 };
     }
     if (s.candidato.n < cfg.framesEstaveis || agora - s.ultimoAcerto < cfg.pausaEntreDardosMs) {
       return { tipo: 'candidato', n: s.candidato.n, ...info };
     }
 
-    // 5) dardo confirmado
-    const dist = Math.hypot(novo.x - centro.x, novo.y - centro.y) / raio;
+    // 5) dardo confirmado: pontua pela PONTA
+    const dist = distElipse(geom, p.x, p.y);
     let pontos = 0;
     let anel = 'Fora';
     for (const a of [...(aneis || [])].sort((x, y) => x.raio - y.raio)) {
       if (dist <= a.raio) { pontos = a.pontos; anel = a.nome; break; }
     }
-    s.dardos.push({ x: novo.x, y: novo.y });
+    s.dardos.push({ x: p.x, y: p.y });
     s.candidato = null;
     s.ultimoAcerto = agora;
-    copiarAlinhado(s.fundo, atual, N, N, ox, oy); // o dardo passa a ser fundo
-    return { tipo: 'acerto', x: novo.x, y: novo.y, dist, pontos, anel, area: novo.area, ...info };
+    copiarRegiao(s.fundo, atual, N, N, ox, oy, novo.pixels); // só ESTE dardo vira fundo
+    return {
+      tipo: 'acerto', x: p.x, y: p.y, aletas: novo.aletas, dist, pontos, anel,
+      area: novo.area, comp: novo.comp, espessura: novo.espessura, ...info,
+    };
   }
 
-  return { processar, reiniciar, estado: s, mascara, raio, centro };
+  return { processar, reiniciar, estado: s, mascara, geom };
 }

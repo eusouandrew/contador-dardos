@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { borrar, brilhoMedio, CONFIG_PADRAO, contarDedos, criarDetector, extrairRGB } from './deteccao';
+import { ajustarAlvo, borrar, brilhoMedio, CONFIG_PADRAO, contarDedos, criarDetector, extrairRGB } from './deteccao';
 
 const TAM_PROC = 220;            // recorte quadrado em volta do alvo, em pixels
 const INTERVALO_MS = 150;        // ~6,5 análises por segundo
@@ -9,6 +9,9 @@ const ESPERA_POS_MAO_MS = 1500;  // ignora o alvo logo depois de ver uma mão
 const GESTO_MS = 800;            // tempo segurando o gesto
 const GESTO_PAUSA_MS = 2500;     // intervalo entre trocas
 const RAIO_MIN_PX = 70;          // abaixo disso o dardo fica pequeno demais na imagem
+const LARG_CALIB = 480;          // resolução usada para achar o alvo pela cor
+const RAZAO_FRONTAL = 0.94;      // elipse mais redonda que isso = celular de frente
+const AVISO_SEM_DARDO_MS = 3500; // alvo balançou e nenhum dardo apareceu
 
 const MOTIVOS = {
   aquecendo: 'Ajustando câmera…',
@@ -32,6 +35,22 @@ function salvar(chave, valor) {
   try { localStorage.setItem(chave, JSON.stringify(valor)); } catch { /* ignora */ }
 }
 
+// Calibração: elipse da borda do preto { cx, cy (0–1 do vídeo), a, b (fração da
+// largura do vídeo), ang } + dir (ponta→aletas) quando o celular está de lado.
+// Versões antigas guardavam só um círculo { cx, cy, r }.
+function normalizarCalib(c) {
+  if (!c) return null;
+  if (typeof c.a === 'number') return c;
+  if (typeof c.r === 'number') return { cx: c.cx, cy: c.cy, a: c.r, b: c.r, ang: 0, dir: null };
+  return null;
+}
+
+function eixoCurto(c) {
+  // o eixo curto da elipse é a direção em que os dardos "deitam" na imagem
+  const ang = c.a >= c.b ? c.ang + Math.PI / 2 : c.ang;
+  return { x: Math.cos(ang), y: Math.sin(ang) };
+}
+
 export default function Camera() {
   const video = useRef(null);
   const overlay = useRef(null);
@@ -42,7 +61,7 @@ export default function Camera() {
   const [erro, setErro] = useState('');
   const [status, setStatus] = useState('Toque em "Ligar câmera"');
   const [calib, setCalib] = useState(null);     // { cx, cy, r } normalizado
-  const [passo, setPasso] = useState('parado'); // parado | centro | borda | rodando
+  const [passo, setPasso] = useState('parado'); // parado | centro | direcao | borda | rodando
   const [dedos, setDedos] = useState(0);
   const [maoAtiva, setMaoAtiva] = useState(false);
   const [limiar, setLimiar] = useState(40);
@@ -55,7 +74,9 @@ export default function Camera() {
   const [zoom, setZoom] = useState(null);
 
   const ref = useRef({
-    detector: criarDetector(TAM_PROC),
+    detector: null,
+    movPendente: false, // alvo balançou e ainda não apareceu dardo
+    ultimoMov: 0,
     atual: new Float32Array(TAM_PROC * TAM_PROC * 3),
     tmp: new Float32Array(TAM_PROC * TAM_PROC * 3),
     dardosVideo: [],   // posições pontuadas, normalizadas no vídeo, para o overlay
@@ -90,7 +111,8 @@ export default function Camera() {
   }, []);
 
   const reiniciarFundo = useCallback((msg) => {
-    ref.current.detector.reiniciar();
+    ref.current.detector?.reiniciar();
+    ref.current.movPendente = false;
     ref.current.dardosVideo = [];
     if (msg) setStatus(msg);
   }, []);
@@ -112,7 +134,7 @@ export default function Camera() {
 
   // --- calibração salva ---
   useEffect(() => {
-    const salvo = lerSalvo('dardos:calib');
+    const salvo = normalizarCalib(lerSalvo('dardos:calib'));
     if (salvo) setCalib(salvo);
   }, []);
 
@@ -265,6 +287,8 @@ export default function Camera() {
   // --- detecção dos dardos ---
   useEffect(() => {
     if (passo !== 'rodando' || !calib) return;
+    let detector = null;
+    let geoLado = 0;
     reiniciarFundo();
 
     const id = setInterval(() => {
@@ -277,9 +301,22 @@ export default function Camera() {
       const vw = v.videoWidth;
       const vh = v.videoHeight;
       const N = TAM_PROC;
-      const lado = r.calib.r * vw * CONFIG_PADRAO.folga * 2;
+      const lado = Math.max(r.calib.a, r.calib.b) * vw * CONFIG_PADRAO.folga * 2;
       const sx = r.calib.cx * vw - lado / 2;
       const sy = r.calib.cy * vh - lado / 2;
+      if (!detector || geoLado !== lado) {
+        const k = (vw * N) / lado; // fração da largura do vídeo → px do recorte
+        detector = criarDetector(N, {
+          cx: N / 2,
+          cy: N / 2,
+          a: r.calib.a * k,
+          b: r.calib.b * k,
+          ang: r.calib.ang,
+          dir: r.calib.dir || null,
+        });
+        geoLado = lado;
+        r.detector = detector;
+      }
 
       if (c.width !== N) {
         c.width = N;
@@ -305,17 +342,31 @@ export default function Camera() {
         }
       }
 
-      const ev = r.detector.processar(r.atual, {
+      const ev = detector.processar(r.atual, {
         agora: Date.now(),
         maoRecente: Date.now() - r.ultimaMao < ESPERA_POS_MAO_MS,
         limiar: r.limiar,
         aneis: r.estado?.aneis || [],
       });
 
-      const raioPx = Math.round(r.calib.r * vw);
+      const raioPx = Math.round(Math.sqrt(r.calib.a * r.calib.b) * vw);
       setDiag({ ...ev, res: `${vw}×${vh}`, raioPx });
 
-      if (r.verDiag && debug.current) desenharDiagnostico(debug.current, img, r.detector);
+      if (r.verDiag && debug.current) desenharDiagnostico(debug.current, img, detector);
+
+      // alvo balançou (dardo bateu?) mas nenhum dardo apareceu depois de assentar:
+      // é o que acontece com dardo vermelho na mosca vermelha, que a câmera não enxerga
+      const agoraMs = Date.now();
+      if (ev.tipo === 'movendo') {
+        r.movPendente = true;
+        r.ultimoMov = agoraMs;
+      } else if (ev.tipo === 'mao' || ev.tipo === 'acerto' || ev.tipo === 'luz') {
+        r.movPendente = false;
+      } else if (r.movPendente && ev.tipo === 'nada' && agoraMs - r.ultimoMov > AVISO_SEM_DARDO_MS) {
+        r.movPendente = false;
+        setStatus('Alvo mexeu mas não vi dardo — se foi na mosca, toque +200');
+        return;
+      }
 
       if (ev.tipo === 'acerto') {
         r.dardosVideo.push({ nx: (sx + (ev.x / N) * lado) / vw, ny: (sy + (ev.y / N) * lado) / vh });
@@ -342,9 +393,12 @@ export default function Camera() {
       const rect = v.getBoundingClientRect();
       if (rect.width === 0) return;
       const dpr = window.devicePixelRatio || 1;
-      if (cv.width !== Math.round(rect.width * dpr)) {
-        cv.width = Math.round(rect.width * dpr);
-        cv.height = Math.round(rect.height * dpr);
+      // confere as duas medidas: o canvas nasce antes do vídeo ter altura
+      const w = Math.round(rect.width * dpr);
+      const h = Math.round(rect.height * dpr);
+      if (cv.width !== w || cv.height !== h) {
+        cv.width = w;
+        cv.height = h;
       }
       const ctx = cv.getContext('2d');
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -353,13 +407,31 @@ export default function Camera() {
 
       const cx = calib.cx * rect.width;
       const cy = calib.cy * rect.height;
-      const raio = calib.r * rect.width;
       ctx.lineWidth = 2;
       for (const a of estado?.aneis || []) {
         ctx.strokeStyle = a.cor === '#1d1d1d' ? '#ffffff' : a.cor || '#f2c500';
         ctx.globalAlpha = 0.85;
         ctx.beginPath();
-        ctx.arc(cx, cy, raio * a.raio, 0, Math.PI * 2);
+        ctx.ellipse(cx, cy, calib.a * rect.width * a.raio, calib.b * rect.width * a.raio, calib.ang, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      // seta: para onde as aletas apontam (a ponta fica do outro lado)
+      if (calib.dir) {
+        const L = Math.max(calib.a, calib.b) * rect.width * 0.35;
+        const ex = cx + calib.dir.x * L;
+        const ey = cy + calib.dir.y * L;
+        ctx.strokeStyle = '#2fbf71';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+        const ang = Math.atan2(calib.dir.y, calib.dir.x);
+        ctx.beginPath();
+        ctx.moveTo(ex, ey);
+        ctx.lineTo(ex - 10 * Math.cos(ang - 0.5), ey - 10 * Math.sin(ang - 0.5));
+        ctx.moveTo(ex, ey);
+        ctx.lineTo(ex - 10 * Math.cos(ang + 0.5), ey - 10 * Math.sin(ang + 0.5));
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
@@ -374,24 +446,72 @@ export default function Camera() {
     return () => cancelAnimationFrame(raf);
   }, [calib, estado]);
 
+  // Acha o alvo pela cor a partir do toque no centro.
+  const calibrarAuto = (nx, ny) => {
+    const v = video.current;
+    if (!v || !v.videoWidth) return null;
+    const W = LARG_CALIB;
+    const H = Math.round((v.videoHeight / v.videoWidth) * W);
+    const c = document.createElement('canvas');
+    c.width = W;
+    c.height = H;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(v, 0, 0, W, H);
+    const img = new Float32Array(W * H * 3);
+    extrairRGB(ctx.getImageData(0, 0, W, H), img);
+    borrar(img, new Float32Array(img.length), W, H);
+    const amarelo = (estado?.aneis || []).find((a) => /amarelo/i.test(a.nome))?.raio || 0.57;
+    const g = ajustarAlvo(img, W, H, nx * W, ny * H, amarelo);
+    if (!g) return null;
+    return { cx: g.cx / W, cy: g.cy / H, a: g.a / W, b: g.b / W, ang: g.ang, dir: null };
+  };
+
   const tocar = (ev) => {
     if (passo !== 'centro' && passo !== 'borda') return;
     const rect = ev.currentTarget.getBoundingClientRect();
     const nx = (ev.clientX - rect.left) / rect.width;
     const ny = (ev.clientY - rect.top) / rect.height;
     if (passo === 'centro') {
-      setCalib({ cx: nx, cy: ny, r: 0.05 });
+      const auto = calibrarAuto(nx, ny);
+      if (auto) {
+        setCalib(auto);
+        if (Math.min(auto.a, auto.b) / Math.max(auto.a, auto.b) < RAZAO_FRONTAL) {
+          setPasso('direcao');
+          setStatus('Alvo encontrado. Confira os anéis e responda abaixo');
+        } else {
+          setPasso('rodando');
+          setStatus('Alvo encontrado (celular de frente). Ajustando câmera…');
+        }
+        return;
+      }
+      // não achou pela cor: volta para o método manual
+      setCalib({ cx: nx, cy: ny, a: 0.05, b: 0.05, ang: 0, dir: null });
       setPasso('borda');
-      setStatus('Agora toque na BORDA externa do círculo preto');
+      setStatus('Não achei o alvo pela cor — toque na BORDA do círculo preto');
     } else {
       setCalib((c) => {
         const dx = nx - c.cx;
         const dy = (ny - c.cy) * (rect.height / rect.width);
-        return { ...c, r: Math.max(0.02, Math.hypot(dx, dy)) };
+        const r = Math.max(0.02, Math.hypot(dx, dy));
+        return { ...c, a: r, b: r, ang: 0, dir: null };
       });
       setPasso('rodando');
       setStatus('Calibrado. Ajustando câmera…');
     }
+  };
+
+  const escolherDirecao = (sinal) => {
+    setCalib((c) => {
+      if (sinal === 0) return { ...c, dir: null };
+      const m = eixoCurto(c);
+      // sinal −1 = aletas à esquerda/acima da ponta; +1 = à direita/abaixo
+      const horizontal = Math.abs(m.x) >= Math.abs(m.y);
+      const comp = horizontal ? m.x : m.y;
+      const s = Math.sign(comp) === sinal ? 1 : -1;
+      return { ...c, dir: { x: m.x * s, y: m.y * s } };
+    });
+    setPasso('rodando');
+    setStatus('Calibrado. Ajustando câmera…');
   };
 
   const jogadorAtual = estado?.jogadores?.[estado.atual];
@@ -439,6 +559,29 @@ export default function Camera() {
         />
       </div>
       <canvas ref={proc} style={{ display: 'none' }} />
+
+      {passo === 'direcao' && calib && (() => {
+        const m = eixoCurto(calib);
+        const horizontal = Math.abs(m.x) >= Math.abs(m.y);
+        return (
+          <div className="card" style={{ display: 'grid', gap: 10, borderColor: 'var(--amarelo)' }}>
+            <b>O celular está de lado, então os dardos aparecem "deitados".</b>
+            <span className="fraco" style={{ fontSize: 14 }}>
+              Olhe um dardo cravado na imagem: as <b>aletas</b> (penas) ficam de que lado da <b>ponta</b>?
+              {' '}Se não tiver dardo no alvo, jogue um e veja.
+            </span>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button className="primario" onClick={() => escolherDirecao(-1)}>
+                {horizontal ? '← Aletas à esquerda' : '↑ Aletas acima'}
+              </button>
+              <button className="primario" onClick={() => escolherDirecao(1)}>
+                {horizontal ? 'Aletas à direita →' : '↓ Aletas abaixo'}
+              </button>
+              <button onClick={() => escolherDirecao(0)}>Não dá pra ver</button>
+            </div>
+          </div>
+        );
+      })()}
 
       <div className="card" style={{ display: 'grid', gap: 8 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, gap: 8 }}>
@@ -510,6 +653,10 @@ export default function Camera() {
                 Raio do alvo: {diag?.raioPx ?? '—'} px{' '}
                 {diag?.raioPx < RAIO_MIN_PX ? <b style={{ color: 'var(--vermelho)' }}>(pequeno)</b> : ''}
               </span>
+              <span>
+                Alvo: {calib ? `${(Math.min(calib.a, calib.b) / Math.max(calib.a, calib.b)).toFixed(2)} redondo` : '—'}
+                {calib?.dir ? ' · com direção' : ' · de frente'}
+              </span>
               <span>Ruído: {(ruido * 100).toFixed(2)}%</span>
               <span>Deslocamento: {diag?.ox ?? 0}, {diag?.oy ?? 0}</span>
               <span>Maior mancha: {diag?.maiorArea ?? 0} px (mín. {diag?.areaMin ?? '—'})</span>
@@ -544,9 +691,10 @@ function desenharDiagnostico(canvas, img, detector) {
     saida.data[p + 3] = 255;
   }
   ctx.putImageData(saida, 0, 0);
+  const g = detector.geom;
   ctx.strokeStyle = 'rgba(255,255,255,.6)';
   ctx.beginPath();
-  ctx.arc(detector.centro.x, detector.centro.y, detector.raio, 0, Math.PI * 2);
+  ctx.ellipse(g.cx, g.cy, g.a, g.b, g.ang, 0, Math.PI * 2);
   ctx.stroke();
   ctx.fillStyle = '#2fbf71';
   for (const d of detector.estado.dardos) {
