@@ -1,33 +1,42 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  adaptarFundo,
-  blobs,
-  borrar,
-  brilhoMedio,
-  contarDedos,
-  extrairRGB,
-  mascaraDiferenca,
-} from './deteccao';
+import { borrar, brilhoMedio, CONFIG_PADRAO, contarDedos, criarDetector, extrairRGB } from './deteccao';
 
 const TAM_PROC = 220;            // recorte quadrado em volta do alvo, em pixels
-const FOLGA = 1.12;              // recorte cobre 1,12× o raio do alvo
-const RAIO_UTIL = 1.06;          // fora disso é borda amarela (0 pts): nem olha
 const INTERVALO_MS = 150;        // ~6,5 análises por segundo
-const FRAMES_ESTAVEIS = 5;       // ~0,75s com o mesmo blob parado
-const FRAMES_AQUECIMENTO = 12;   // ~2s para exposição/foco assentarem
-const MUDANCA_GLOBAL = 0.035;    // >3,5% do alvo mudou de uma vez = luz/tremida
-const ADAPTA_FUNDO = 0.04;       // velocidade com que o fundo segue a luz
-const PAUSA_ENTRE_DARDOS_MS = 1200;
 const ESPERA_POS_MAO_MS = 1500;  // ignora o alvo logo depois de ver uma mão
 const GESTO_MS = 800;            // tempo segurando o gesto
 const GESTO_PAUSA_MS = 2500;     // intervalo entre trocas
+const RAIO_MIN_PX = 70;          // abaixo disso o dardo fica pequeno demais na imagem
+
+const MOTIVOS = {
+  aquecendo: 'Ajustando câmera…',
+  movendo: 'Alvo se mexendo — esperando parar',
+  mao: 'Mão na frente — pausado',
+  luz: 'Mudança de luz — conferindo',
+  nada: 'Pronto — pode jogar',
+  candidato: 'Possível dardo… confirmando',
+};
+
+function lerSalvo(chave) {
+  try {
+    const v = localStorage.getItem(chave);
+    return v ? JSON.parse(v) : null;
+  } catch {
+    return null;
+  }
+}
+
+function salvar(chave, valor) {
+  try { localStorage.setItem(chave, JSON.stringify(valor)); } catch { /* ignora */ }
+}
 
 export default function Camera() {
   const video = useRef(null);
   const overlay = useRef(null);
   const proc = useRef(null);
+  const debug = useRef(null);
 
   const [estado, setEstado] = useState(null);
   const [erro, setErro] = useState('');
@@ -37,20 +46,19 @@ export default function Camera() {
   const [dedos, setDedos] = useState(0);
   const [maoAtiva, setMaoAtiva] = useState(false);
   const [limiar, setLimiar] = useState(40);
-  const [ruido, setRuido] = useState(0);
+  const [diag, setDiag] = useState(null);
+  const [verDiag, setVerDiag] = useState(false);
   const [telaPreta, setTelaPreta] = useState(false);
   const [gestosOk, setGestosOk] = useState(false);
   const [trava, setTrava] = useState('');
+  const [zoomCaps, setZoomCaps] = useState(null);
+  const [zoom, setZoom] = useState(null);
 
   const ref = useRef({
-    fundo: null,
-    atual: null,
-    tmp: null,
-    mascara: null,
-    aquecendo: 0,
-    dardos: [],        // já pontuados { x, y } no recorte + { nx, ny } no vídeo
-    candidato: null,   // { x, y, n }
-    ultimoAcerto: 0,
+    detector: criarDetector(TAM_PROC),
+    atual: new Float32Array(TAM_PROC * TAM_PROC * 3),
+    tmp: new Float32Array(TAM_PROC * TAM_PROC * 3),
+    dardosVideo: [],   // posições pontuadas, normalizadas no vídeo, para o overlay
     ultimaMao: 0,
     gestoAtual: 0,
     gestoDesde: 0,
@@ -60,11 +68,13 @@ export default function Camera() {
     calib: null,
     limiar: 40,
     estado: null,
+    verDiag: false,
   });
 
   ref.current.calib = calib;
   ref.current.limiar = limiar;
   ref.current.estado = estado;
+  ref.current.verDiag = verDiag;
 
   const enviar = useCallback(async (acao) => {
     try {
@@ -80,10 +90,8 @@ export default function Camera() {
   }, []);
 
   const reiniciarFundo = useCallback((msg) => {
-    const r = ref.current;
-    r.fundo = null;
-    r.dardos = [];
-    r.candidato = null;
+    ref.current.detector.reiniciar();
+    ref.current.dardosVideo = [];
     if (msg) setStatus(msg);
   }, []);
 
@@ -104,33 +112,24 @@ export default function Camera() {
 
   // --- calibração salva ---
   useEffect(() => {
-    try {
-      const salvo = localStorage.getItem('dardos:calib');
-      if (salvo) setCalib(JSON.parse(salvo));
-    } catch { /* ignora */ }
+    const salvo = lerSalvo('dardos:calib');
+    if (salvo) setCalib(salvo);
   }, []);
 
   useEffect(() => {
-    if (calib) {
-      try { localStorage.setItem('dardos:calib', JSON.stringify(calib)); } catch { /* ignora */ }
-    }
+    if (calib) salvar('dardos:calib', calib);
   }, [calib]);
 
   // Trava exposição/balanço de branco/foco no valor atual, se o aparelho deixar.
-  // O ajuste automático é o que mais gera "dardo fantasma" com o alvo vazio.
   const travarCamera = useCallback(async (travar) => {
     const track = ref.current.track;
     if (!track?.getCapabilities) { setTrava('sem suporte'); return; }
     const caps = track.getCapabilities();
-    const modo = (chave, alvo) => (caps[chave]?.includes?.(alvo) ? alvo : undefined);
     const alvo = travar ? 'manual' : 'continuous';
     const adv = {};
-    const exp = modo('exposureMode', alvo);
-    const wb = modo('whiteBalanceMode', alvo);
-    const foco = modo('focusMode', alvo);
-    if (exp) adv.exposureMode = exp;
-    if (wb) adv.whiteBalanceMode = wb;
-    if (foco) adv.focusMode = foco;
+    for (const chave of ['exposureMode', 'whiteBalanceMode', 'focusMode']) {
+      if (caps[chave]?.includes?.(alvo)) adv[chave] = alvo;
+    }
     if (!Object.keys(adv).length) { setTrava('sem suporte'); return; }
     try {
       await track.applyConstraints({ advanced: [adv] });
@@ -141,17 +140,41 @@ export default function Camera() {
     }
   }, [reiniciarFundo]);
 
+  const aplicarZoom = useCallback(async (valor, recalibrar) => {
+    const track = ref.current.track;
+    if (!track) return;
+    try {
+      await track.applyConstraints({ advanced: [{ zoom: valor }] });
+      setZoom(valor);
+      salvar('dardos:zoom', valor);
+      if (recalibrar) {
+        setPasso('centro');
+        setStatus('Zoom mudou — toque no CENTRO do alvo');
+      }
+    } catch { /* aparelho recusou */ }
+  }, []);
+
   // --- câmera ---
   const ligarCamera = useCallback(async () => {
     setErro('');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 } },
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false,
       });
       video.current.srcObject = stream;
-      ref.current.track = stream.getVideoTracks()[0];
+      const track = stream.getVideoTracks()[0];
+      ref.current.track = track;
       await video.current.play();
+
+      const caps = track.getCapabilities?.() || {};
+      if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+        setZoomCaps(caps.zoom);
+        const z = lerSalvo('dardos:zoom');
+        if (z) await aplicarZoom(z, false);
+        else setZoom(track.getSettings?.().zoom ?? caps.zoom.min);
+      }
+
       setStatus(calib ? 'Ajustando câmera…' : 'Toque no CENTRO do alvo');
       setPasso(calib ? 'rodando' : 'centro');
       try { await navigator.wakeLock?.request('screen'); } catch { /* ignora */ }
@@ -160,7 +183,7 @@ export default function Camera() {
     } catch (e) {
       setErro('Não consegui abrir a câmera: ' + e.message + ' (precisa ser HTTPS)');
     }
-  }, [calib]);
+  }, [calib, aplicarZoom]);
 
   // --- MediaPipe: mãos ---
   useEffect(() => {
@@ -253,27 +276,21 @@ export default function Camera() {
       // recorte quadrado em volta do alvo, na resolução cheia do vídeo
       const vw = v.videoWidth;
       const vh = v.videoHeight;
-      const lado = r.calib.r * vw * FOLGA * 2;
+      const N = TAM_PROC;
+      const lado = r.calib.r * vw * CONFIG_PADRAO.folga * 2;
       const sx = r.calib.cx * vw - lado / 2;
       const sy = r.calib.cy * vh - lado / 2;
-      const N = TAM_PROC;
 
       if (c.width !== N) {
         c.width = N;
         c.height = N;
       }
-      if (!r.atual || r.atual.length !== N * N * 3) {
-        r.atual = new Float32Array(N * N * 3);
-        r.tmp = new Float32Array(N * N * 3);
-        r.mascara = new Uint8Array(N * N);
-        r.fundo = null;
-      }
-
       const ctx = c.getContext('2d', { willReadFrequently: true });
       ctx.fillStyle = '#000';
       ctx.fillRect(0, 0, N, N);
       ctx.drawImage(v, sx, sy, lado, lado, 0, 0, N, N);
-      extrairRGB(ctx.getImageData(0, 0, N, N), r.atual);
+      const img = ctx.getImageData(0, 0, N, N);
+      extrairRGB(img, r.atual);
       borrar(r.atual, r.tmp, N, N);
 
       // confere se travar a exposição não estragou a imagem
@@ -283,91 +300,33 @@ export default function Camera() {
           r.travaCheck.brilho = b;
           travarCamera(true);
         } else if (++r.travaCheck.frames >= 8) {
-          if (Math.abs(b - r.travaCheck.brilho) > r.travaCheck.brilho * 0.25) {
-            travarCamera(false);
-          }
+          if (Math.abs(b - r.travaCheck.brilho) > r.travaCheck.brilho * 0.25) travarCamera(false);
           r.travaCheck = null;
         }
       }
 
-      if (!r.fundo) {
-        r.fundo = Float32Array.from(r.atual);
-        r.dardos = [];
-        r.candidato = null;
-        r.aquecendo = FRAMES_AQUECIMENTO;
-        setStatus('Ajustando câmera…');
-        return;
-      }
-      if (r.aquecendo > 0) {
-        r.fundo.set(r.atual);
-        if (--r.aquecendo === 0) setStatus('Pronto — pode jogar');
-        return;
-      }
-
-      // mão na frente do alvo: nada é dardo
-      if (Date.now() - r.ultimaMao < ESPERA_POS_MAO_MS) {
-        r.candidato = null;
-        return;
-      }
-
-      const centro = { x: N / 2, y: N / 2 };
-      const raio = N / 2 / FOLGA;
-      const { mudados, total } = mascaraDiferenca(
-        r.atual, r.fundo, N, N, centro, raio * RAIO_UTIL, r.limiar, r.mascara
-      );
-      const fracao = total ? mudados / total : 0;
-      setRuido(fracao);
-
-      // muita coisa mudou de uma vez: é luz, exposição ou o celular mexeu
-      if (fracao > MUDANCA_GLOBAL) {
-        r.fundo.set(r.atual);
-        r.candidato = null;
-        setStatus('Mudança de luz/câmera — fundo atualizado');
-        return;
-      }
-
-      adaptarFundo(r.fundo, r.atual, r.mascara, ADAPTA_FUNDO);
-
-      // a cruz do dardo ocupa ~0,15 do raio; ruído de textura fica bem abaixo
-      const areaMin = Math.max(10, Math.round(raio * raio * 0.002));
-      const areaMax = Math.round(raio * raio * 0.06);
-      const lista = blobs(r.mascara, N, N, areaMin, areaMax);
-      const novo = lista.find(
-        (b) => !r.dardos.some((d) => Math.hypot(d.x - b.x, d.y - b.y) < raio * 0.1)
-      );
-
-      if (!novo) {
-        r.candidato = null;
-        return;
-      }
-      if (r.candidato && Math.hypot(r.candidato.x - novo.x, r.candidato.y - novo.y) < raio * 0.04) {
-        r.candidato.n += 1;
-      } else {
-        r.candidato = { x: novo.x, y: novo.y, n: 1 };
-      }
-      if (r.candidato.n < FRAMES_ESTAVEIS) return;
-      if (Date.now() - r.ultimoAcerto < PAUSA_ENTRE_DARDOS_MS) return;
-
-      // dardo confirmado
-      const dist = Math.hypot(novo.x - centro.x, novo.y - centro.y) / raio;
-      const aneis = r.estado?.aneis || [];
-      let pontos = 0;
-      let anel = 'Fora';
-      for (const a of [...aneis].sort((x, y) => x.raio - y.raio)) {
-        if (dist <= a.raio) { pontos = a.pontos; anel = a.nome; break; }
-      }
-      r.dardos.push({
-        x: novo.x,
-        y: novo.y,
-        nx: (sx + (novo.x / N) * lado) / vw,
-        ny: (sy + (novo.y / N) * lado) / vh,
+      const ev = r.detector.processar(r.atual, {
+        agora: Date.now(),
+        maoRecente: Date.now() - r.ultimaMao < ESPERA_POS_MAO_MS,
+        limiar: r.limiar,
+        aneis: r.estado?.aneis || [],
       });
-      r.candidato = null;
-      r.ultimoAcerto = Date.now();
-      r.fundo.set(r.atual); // o dardo passa a ser fundo
-      enviar({ tipo: 'acerto', pontos, anel, origem: 'camera' });
-      setStatus(`${anel}: ${pontos} pts`);
-      if (navigator.vibrate) navigator.vibrate(60);
+
+      const raioPx = Math.round(r.calib.r * vw);
+      setDiag({ ...ev, res: `${vw}×${vh}`, raioPx });
+
+      if (r.verDiag && debug.current) desenharDiagnostico(debug.current, img, r.detector);
+
+      if (ev.tipo === 'acerto') {
+        r.dardosVideo.push({ nx: (sx + (ev.x / N) * lado) / vw, ny: (sy + (ev.y / N) * lado) / vh });
+        enviar({ tipo: 'acerto', pontos: ev.pontos, anel: ev.anel, origem: 'camera' });
+        setStatus(`${ev.anel}: ${ev.pontos} pts`);
+        if (navigator.vibrate) navigator.vibrate(60);
+      } else if (ev.tipo === 'nada' && raioPx < RAIO_MIN_PX) {
+        setStatus('Alvo pequeno na imagem — aproxime o celular ou use o zoom');
+      } else if (ev.tipo !== 'candidato' || ev.n === 1) {
+        setStatus(ev.tipo === 'luz' && ev.trocouFundo ? 'Luz mudou — fundo atualizado' : MOTIVOS[ev.tipo]);
+      }
     }, INTERVALO_MS);
     return () => clearInterval(id);
   }, [passo, calib, enviar, reiniciarFundo, travarCamera]);
@@ -395,9 +354,8 @@ export default function Camera() {
       const cx = calib.cx * rect.width;
       const cy = calib.cy * rect.height;
       const raio = calib.r * rect.width;
-      const aneis = estado?.aneis || [];
       ctx.lineWidth = 2;
-      for (const a of aneis) {
+      for (const a of estado?.aneis || []) {
         ctx.strokeStyle = a.cor === '#1d1d1d' ? '#ffffff' : a.cor || '#f2c500';
         ctx.globalAlpha = 0.85;
         ctx.beginPath();
@@ -406,7 +364,7 @@ export default function Camera() {
       }
       ctx.globalAlpha = 1;
       ctx.fillStyle = '#2fbf71';
-      for (const d of ref.current.dardos) {
+      for (const d of ref.current.dardosVideo) {
         ctx.beginPath();
         ctx.arc(d.nx * rect.width, d.ny * rect.height, 6, 0, Math.PI * 2);
         ctx.fill();
@@ -437,7 +395,8 @@ export default function Camera() {
   };
 
   const jogadorAtual = estado?.jogadores?.[estado.atual];
-  const corRuido = ruido > MUDANCA_GLOBAL ? 'var(--vermelho)' : ruido > 0.01 ? 'var(--amarelo)' : 'var(--verde)';
+  const ruido = diag?.ruido || 0;
+  const corRuido = ruido > CONFIG_PADRAO.mudancaGlobal ? 'var(--vermelho)' : ruido > 0.01 ? 'var(--amarelo)' : 'var(--verde)';
 
   return (
     <main style={{ padding: 12, display: 'grid', gap: 12, maxWidth: 680, margin: '0 auto' }}>
@@ -506,7 +465,22 @@ export default function Camera() {
           <button onClick={() => enviar({ tipo: 'desfazer' })}>Desfazer</button>
           <button onClick={() => enviar({ tipo: 'proximo' })}>Próximo jogador</button>
           <button onClick={() => setTelaPreta(true)}>Modo tela preta</button>
+          <button onClick={() => setVerDiag((d) => !d)}>{verDiag ? 'Fechar diagnóstico' : 'Diagnóstico'}</button>
         </div>
+        {zoomCaps && zoom !== null && (
+          <label style={{ fontSize: 13 }} className="fraco">
+            Zoom: {Number(zoom).toFixed(1)}× (recalibra ao mudar)
+            <input
+              type="range"
+              min={zoomCaps.min}
+              max={zoomCaps.max}
+              step={zoomCaps.step || 0.1}
+              value={zoom}
+              onChange={(e) => aplicarZoom(Number(e.target.value), true)}
+              style={{ width: '100%' }}
+            />
+          </label>
+        )}
         <label style={{ fontSize: 13 }} className="fraco">
           Sensibilidade (quanto menor, mais sensível): {limiar}
           <input
@@ -520,11 +494,64 @@ export default function Camera() {
         </label>
       </div>
 
+      {verDiag && (
+        <div className="card" style={{ display: 'grid', gap: 8, fontSize: 13 }}>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+            <canvas
+              ref={debug}
+              width={TAM_PROC}
+              height={TAM_PROC}
+              style={{ width: 160, height: 160, borderRadius: 8, background: '#000', flexShrink: 0 }}
+            />
+            <div className="fraco" style={{ display: 'grid', gap: 4, fontVariantNumeric: 'tabular-nums' }}>
+              <span>Estado: <b style={{ color: 'var(--txt)' }}>{diag?.tipo || '—'}</b></span>
+              <span>Vídeo: {diag?.res || '—'}</span>
+              <span>
+                Raio do alvo: {diag?.raioPx ?? '—'} px{' '}
+                {diag?.raioPx < RAIO_MIN_PX ? <b style={{ color: 'var(--vermelho)' }}>(pequeno)</b> : ''}
+              </span>
+              <span>Ruído: {(ruido * 100).toFixed(2)}%</span>
+              <span>Deslocamento: {diag?.ox ?? 0}, {diag?.oy ?? 0}</span>
+              <span>Maior mancha: {diag?.maiorArea ?? 0} px (mín. {diag?.areaMin ?? '—'})</span>
+            </div>
+          </div>
+          <span className="fraco">Vermelho = pixels diferentes do fundo. Um dardo novo deve virar uma mancha vermelha.</span>
+        </div>
+      )}
+
       <p className="fraco" style={{ fontSize: 13, margin: 0, lineHeight: 1.5 }}>
-        Com o alvo vazio, o <b>Ruído</b> deve ficar verde (abaixo de 1%). Se ficar amarelo, aumente a
-        sensibilidade. O Android pausa a câmera se a tela apagar — use o <b>modo tela preta</b> com o brilho
-        no mínimo. Mantenha o celular imóvel: qualquer tranco exige recalibrar.
+        Com o alvo vazio, o <b>Ruído</b> deve ficar verde (abaixo de 1%). O Android pausa a câmera se a tela
+        apagar — use o <b>modo tela preta</b> com o brilho no mínimo.
       </p>
     </main>
   );
+}
+
+function desenharDiagnostico(canvas, img, detector) {
+  const ctx = canvas.getContext('2d');
+  const saida = ctx.createImageData(img.width, img.height);
+  const m = detector.mascara;
+  for (let i = 0, p = 0; i < m.length; i++, p += 4) {
+    if (m[i]) {
+      saida.data[p] = 255;
+      saida.data[p + 1] = 40;
+      saida.data[p + 2] = 40;
+    } else {
+      saida.data[p] = img.data[p] * 0.7;
+      saida.data[p + 1] = img.data[p + 1] * 0.7;
+      saida.data[p + 2] = img.data[p + 2] * 0.7;
+    }
+    saida.data[p + 3] = 255;
+  }
+  ctx.putImageData(saida, 0, 0);
+  ctx.strokeStyle = 'rgba(255,255,255,.6)';
+  ctx.beginPath();
+  ctx.arc(detector.centro.x, detector.centro.y, detector.raio, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = '#2fbf71';
+  for (const d of detector.estado.dardos) {
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
 }
